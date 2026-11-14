@@ -1,9 +1,10 @@
 package mcservice
 
 import (
+	"bufio"
 	"context"
-	"errors"
-	"log"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,14 +12,14 @@ import (
 
 	"github.com/liteldev/LeviLauncher/internal/apppath"
 	"github.com/liteldev/LeviLauncher/internal/eventsink"
+	"github.com/liteldev/LeviLauncher/internal/extractor"
 	"github.com/liteldev/LeviLauncher/internal/leviloader"
 	"github.com/liteldev/LeviLauncher/internal/msixvc"
-	"github.com/liteldev/LeviLauncher/internal/nativeinstall"
 	"github.com/liteldev/LeviLauncher/internal/types"
 	"github.com/liteldev/LeviLauncher/internal/utils"
 	"github.com/liteldev/LeviLauncher/internal/versions"
+	"gopkg.in/natefinch/npipe.v2"
 )
-
 type VersionStatus struct {
 	Version      string `json:"version"`
 	IsInstalled  bool   `json:"isInstalled"`
@@ -35,6 +36,12 @@ func CancelMsixvcDownload()                { msixvc.Cancel() }
 func CancelMsixvcDownloadTask(dest string) { msixvc.CancelTask(dest) }
 
 func InstallExtractMsixvc(ctx context.Context, name string, folderName string, isPreview bool) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "ERR_CANCELED"
+	}
 	n := strings.TrimSpace(name)
 	if n == "" {
 		return "ERR_MSIXVC_NOT_SPECIFIED"
@@ -58,43 +65,80 @@ func InstallExtractMsixvc(ctx context.Context, name string, folderName string, i
 		return "ERR_INVALID_FOLDER_NAME"
 	}
 	outDir := filepath.Join(vdir, folder)
-	_, err = nativeinstall.Install(ctx, inPath, outDir, nativeinstall.Options{
-		CacheDir:           apppath.AccountsDir(),
-		RequireFullLicense: true,
-		Prepare:            func(staging string) error { return leviloader.EnsureForVersion(ctx, staging) },
-		Progress: func(p nativeinstall.Progress) {
-			eventsink.From(ctx).Emit(EventExtractProgress, types.ExtractProgress{
-				Dir: outDir, Bytes: p.FileCurrent, TotalBytes: p.FileTotal,
-				GlobalCurrent: p.Current, GlobalTotal: p.Total, CurrentFile: p.File, Ts: time.Now().UnixMilli(),
-			})
-		},
-	})
+	if _, err := os.Lstat(outDir); err == nil {
+		return "ERR_TARGET_EXISTS"
+	} else if !os.IsNotExist(err) {
+		return "ERR_ACCESS_VERSIONS_DIR"
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return "ERR_CREATE_TARGET_DIR"
+	}
+
+	pipeName := fmt.Sprintf("\\\\.\\pipe\\levi_msixvc_progress_%d", time.Now().UnixNano())
+	ln, err := npipe.Listen(pipeName)
 	if err != nil {
-		code, detail := "ERR_NATIVE_MSIXVC", ""
-		var failure *nativeinstall.Error
-		if errors.As(err, &failure) {
-			if cause := failure.Unwrap().Error(); cause != "" {
-				code, detail = failure.Code, failure.Reason+"("+cause+")"
-			} else {
-				code, detail = failure.Code, failure.Reason
+		_ = os.RemoveAll(outDir)
+		eventsink.From(ctx).Emit(EventExtractError, "ERR_CREATE_PIPE")
+		return "ERR_CREATE_PIPE"
+	}
+	defer ln.Close()
+
+	pipeDone := make(chan struct{})
+	go func() {
+		defer close(pipeDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		scanner := bufio.NewScanner(conn)
+		scanner.Buffer(make([]byte, 4096), 1024*1024)
+		for scanner.Scan() {
+			line := strings.ReplaceAll(scanner.Text(), "\\", "/")
+			var p struct {
+				File          string "json:\"file\""
+				Current       int64  "json:\"current\""
+				Total         int64  "json:\"total\""
+				GlobalCurrent int64  "json:\"global_current\""
+				GlobalTotal   int64  "json:\"global_total\""
+			}
+			if err := json.Unmarshal([]byte(line), &p); err == nil {
+				eventsink.From(ctx).Emit(EventExtractProgress, types.ExtractProgress{
+					Dir: outDir, Bytes: p.Current, TotalBytes: p.Total,
+					GlobalCurrent: p.GlobalCurrent, GlobalTotal: p.GlobalTotal,
+					CurrentFile: p.File, Ts: time.Now().UnixMilli(),
+				})
 			}
 		}
-		if errors.Is(err, context.Canceled) {
-			code, detail = "ERR_CANCELED", ""
+	}()
+
+	rc, msg := extractor.GetWithPipe(inPath, outDir, pipeName)
+	_ = ln.Close()
+	<-pipeDone
+	if rc != 0 {
+		if strings.TrimSpace(msg) == "" {
+			msg = "ERR_APPX_INSTALL_FAILED"
 		}
-		eventsink.From(ctx).Emit(EventExtractError, code)
-		// The reason (e.g. which Microsoft step failed and its fault code) is
-		// what makes a report actionable; the GUI and CLI show it after the code.
-		if detail != "" {
-			log.Printf("install msixvc %s: %s", code, detail)
-			return code + ": " + detail
-		}
-		return code
+		eventsink.From(ctx).Emit(EventExtractError, msg)
+		_ = os.RemoveAll(outDir)
+		return msg
+	}
+	// The legacy DLL has no cancellation API. Do not keep a partially useful
+	// version if cancellation was requested while its synchronous call ran.
+	if err := ctx.Err(); err != nil {
+		_ = os.RemoveAll(outDir)
+		eventsink.From(ctx).Emit(EventExtractError, "ERR_CANCELED")
+		return "ERR_CANCELED"
+	}
+	if err := leviloader.EnsureForVersion(ctx, outDir); err != nil {
+		_ = os.RemoveAll(outDir)
+		msg = "ERR_LEVILOADER_PREPARE: " + err.Error()
+		eventsink.From(ctx).Emit(EventExtractError, msg)
+		return msg
 	}
 	eventsink.From(ctx).Emit(EventExtractDone, outDir)
 	return ""
 }
-
 func ResolveDownloadedMsixvc(version string, versionType string) string {
 	dir, err := apppath.InstallersDir()
 	if err != nil || strings.TrimSpace(dir) == "" {

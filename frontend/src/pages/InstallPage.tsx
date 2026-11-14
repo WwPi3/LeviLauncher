@@ -139,11 +139,7 @@ export default function InstallPage() {
   const returnTo: string = String(location?.state?.returnTo || ROUTES.download);
 
   const [installName, setInstallName] = useState<string>(() =>
-    mirrorVersion
-      ? (t("downloadpage.install_folder.default_name", {
-          version: mirrorVersion,
-        }) as unknown as string)
-      : "",
+    mirrorVersion || "",
   );
   const [installIsolation, setInstallIsolation] = useState<boolean>(() =>
     readInstallIsolationPreference(),
